@@ -59,6 +59,7 @@ def main():
     if parser.use_cuda:
         device = 'cuda'
 
+    batch_start = 0
     for i,mtz in enumerate(parser.mtz):
         ds = rs.read_mtz(mtz)
         if cell is None:
@@ -73,6 +74,9 @@ def main():
             sigma_key = get_first_key_of_type(ds, 'Q')
 
         ds['file_id'] = i
+
+        ds['image_id'] = ds.groupby(batch_key).ngroup() + batch_start
+        batch_start = ds['image_id'].max() + 1
         data.append(ds)
 
     ds = rs.concat(data, check_isomorphous=False)
@@ -88,10 +92,6 @@ def main():
 
     reindexing_ops = [gemmi.Op("x,y,z")] 
     reindexing_ops.extend(gemmi.find_twin_laws(cell, spacegroup, parser.max_obliq, False))
-
-
-    ds['image_id'] = ds.groupby([batch_key, 'file_id']).ngroup()
-    image_size = ds.groupby('image_id').size()
 
 
     Hasu = rs.utils.generate_reciprocal_asu(cell, spacegroup, dmin)
@@ -200,7 +200,7 @@ def main():
             idx = mtz_op_id == j
             ds[idx] = ds[idx].apply_symop(op.gemmi_op)
 
-        batch_start = ds['image_id'].max()
+        batch_start = ds['image_id'].max() + 1
         out = mtz[:-4] + parser.mtz_suffix
         del(ds['image_id'])
         ds = ds.set_index(['H', 'K', 'L'])
