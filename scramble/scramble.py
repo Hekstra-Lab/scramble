@@ -7,8 +7,11 @@ from argparse import ArgumentParser
 import gemmi
 import reciprocalspaceship as rs
 import torch
+import numpy as np
+from matplotlib import pyplot as plt
 from scramble.laue import expand_harmonics
 from scramble.model import MergingModel,ScalingModel,SurrogatePosterior,NormalLikelihood
+from os.path import dirname
 
 parser = ArgumentParser(description=__doc__)
 
@@ -183,15 +186,10 @@ def main():
         }, merged=True, cell=cell, spacegroup=spacegroup).set_index(["H", "K", "L"])
         out.write_mtz(parser.mtz_out)
 
-    def reindex_batch(ds):
-        from scramble.symmetry import Op
-        reindexing_ops = [Op("x,y,z"), Op("-x,-y,z")] 
-        op_id = ds.op_id.iloc[0]
-        op = reindexing_ops[op_id].gemmi_op
-        return ds.apply_symop(op)
-
+    csv = 'id,file,' + ','.join([f'"{op.gemmi_op.triplet()}"' for op in reindexing_ops]) + '\n'
     op_id = op_id.detach().cpu().numpy()
     batch_start = 0
+
     for i,mtz in enumerate(parser.mtz):
         ds = rs.read_mtz(mtz).reset_index()
         ds['image_id'] = ds.groupby(batch_key).ngroup() + batch_start
@@ -200,20 +198,28 @@ def main():
             idx = mtz_op_id == j
             ds[idx] = ds[idx].apply_symop(op.gemmi_op)
 
-        batch_start = ds['image_id'].max() + 1
+        batch_end = ds['image_id'].max() + 1
         out = mtz[:-4] + parser.mtz_suffix
         del(ds['image_id'])
         ds = ds.set_index(['H', 'K', 'L'])
         ds.write_mtz(out)
 
-    print("Reindexing operation counts:")
-    for j,op in enumerate(reindexing_ops):
-        name = op.gemmi_op.triplet()
-        counts = (op_id == j).sum()
-        print(f'{name}: {counts}')
+        image_op_id = op_id[batch_start:batch_end]
+        counts = np.bincount(image_op_id, minlength=len(reindexing_ops))
+        line = f"{i+1},{mtz}," + ','.join(map(str, counts)) + '\n'
+        csv = csv + line
+        batch_start = batch_end
 
-    import numpy as np
-    from matplotlib import pyplot as plt
+    counts = np.bincount(op_id, minlength=len(reindexing_ops))
+    line = f"{i+1},Total," + ','.join(map(str, counts)) + '\n'
+    csv = csv + line
+
+    print("Reindexing operation counts:")
+    print(csv)
+    out = dirname(parser.mtz[0]) + '/scramble.log'
+    with open(out, 'w') as f:
+        f.write(csv)
+
     counts = np.bincount(op_id)
     x = np.arange(len(counts))
     plt.bar(x, counts, color='k')
@@ -229,6 +235,9 @@ def main():
     plt.title('Reindexing Results')
     if parser.plot:
         plt.show()
+
+    out = dirname(parser.mtz[0]) + '/scramble.png'
+    plt.savefig(out)
 
 
 if __name__=="__main__":
