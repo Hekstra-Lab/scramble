@@ -34,6 +34,7 @@ parser.add_argument('--mlp-depth', type=float, default=10, help='Depth of the mu
 parser.add_argument('--steps', type=int, default=10_000, help='Number of optimization steps.')
 parser.add_argument('--mtz-out', type=str, default=None)
 parser.add_argument('--mtz-suffix', type=str, default='_scrambled.mtz')
+parser.add_argument('--save-frequency', type=int, default=1_000, help='Save output every --save-frequency=steps with default steps=1_000.')
 parser = parser.parse_args()
 
 
@@ -105,7 +106,8 @@ def main():
     ds = ds[idx]
     ds['harmonic_id'] = ds.groupby(['H_0', 'K_0', 'L_0', batch_key, 'file_id']).ngroup()
 
-    Iobs,SigIobs = ds[['harmonic_id', intensity_key, sigma_key]].groupby('harmonic_id').first().to_numpy().T
+    _,idx = np.unique(ds['harmonic_id'], return_index=True)
+    Iobs,SigIobs = ds[[intensity_key, sigma_key]].iloc[idx].to_numpy().T
 
     hkl = torch.tensor(
         ds.get_hkls(), 
@@ -133,7 +135,7 @@ def main():
         dtype=float_dtype,
     )
     metadata = torch.tensor(
-        ds[metadata_keys].to_numpy(),
+        ds[metadata_keys].to_numpy('float32'),
         device=device,
         dtype=float_dtype,
     )
@@ -155,9 +157,8 @@ def main():
         merging_model = merging_model.cuda()
         data = [datum.cuda() for datum in data]
 
-    save_frequency = 100
     from tqdm import trange
-    bar = trange(parser.steps)
+    bar = trange(1, parser.steps + 1)
     loss = []
     op_ids = []
     for i in bar:
@@ -170,74 +171,78 @@ def main():
         bar.set_postfix({'ELBO' : f'{elbo:0.2e}'})
         op_ids.append(op_id.detach().cpu().numpy())
 
+        do_save = (i % parser.save_frequency == 0) | (i == parser.steps)
+        if not do_save:
+            continue
 
-    if parser.mtz_out is not None:
-        F, SigF = surrogate_posterior.get_f_sigf()
-        q = surrogate_posterior.distribution()
-        h,k,l = surrogate_posterior.reciprocal_asu.Hasu.T
-        out = rs.DataSet({
-            'H' : rs.DataSeries(h, dtype='H'),
-            'K' : rs.DataSeries(k, dtype='H'),
-            'L' : rs.DataSeries(l, dtype='H'),
-            'I' : rs.DataSeries(q.mean.detach().cpu().numpy(), dtype='J'),
-            'SIGI' : rs.DataSeries(q.stddev.detach().cpu().numpy(), dtype='Q'),
-            'F' : rs.DataSeries(F, dtype='F'),
-            'SIGF' : rs.DataSeries(SigF, dtype='Q'),
-        }, merged=True, cell=cell, spacegroup=spacegroup).set_index(["H", "K", "L"])
-        out.write_mtz(parser.mtz_out)
+        print("Saving output checkpoint...")
+        if parser.mtz_out is not None:
+            F, SigF = surrogate_posterior.get_f_sigf()
+            q = surrogate_posterior.distribution()
+            h,k,l = surrogate_posterior.reciprocal_asu.Hasu.T
+            out = rs.DataSet({
+                'H' : rs.DataSeries(h, dtype='H'),
+                'K' : rs.DataSeries(k, dtype='H'),
+                'L' : rs.DataSeries(l, dtype='H'),
+                'I' : rs.DataSeries(q.mean.detach().cpu().numpy(), dtype='J'),
+                'SIGI' : rs.DataSeries(q.stddev.detach().cpu().numpy(), dtype='Q'),
+                'F' : rs.DataSeries(F, dtype='F'),
+                'SIGF' : rs.DataSeries(SigF, dtype='Q'),
+            }, merged=True, cell=cell, spacegroup=spacegroup).set_index(["H", "K", "L"])
+            out.write_mtz(parser.mtz_out)
 
-    csv = 'id,file,' + ','.join([f'"{op.gemmi_op.triplet()}"' for op in reindexing_ops]) + '\n'
-    op_id = op_id.detach().cpu().numpy()
-    batch_start = 0
+        csv = 'id,file,' + ','.join([f'"{op.gemmi_op.triplet()}"' for op in reindexing_ops]) + '\n'
+        op_id = op_id.detach().cpu().numpy()
+        batch_start = 0
 
-    for i,mtz in enumerate(parser.mtz):
-        ds = rs.read_mtz(mtz).reset_index()
-        ds['image_id'] = ds.groupby(batch_key).ngroup() + batch_start
-        mtz_op_id = op_id[ds.image_id.to_numpy()]
-        for j,op in enumerate(reindexing_ops):
-            idx = mtz_op_id == j
-            ds[idx] = ds[idx].apply_symop(op.gemmi_op)
+        for i,mtz in enumerate(parser.mtz):
+            ds = rs.read_mtz(mtz).reset_index()
+            ds['image_id'] = ds.groupby(batch_key).ngroup() + batch_start
+            mtz_op_id = op_id[ds.image_id.to_numpy()]
+            for j,op in enumerate(reindexing_ops):
+                idx = mtz_op_id == j
+                ds[idx] = ds[idx].apply_symop(op.gemmi_op)
 
-        batch_end = ds['image_id'].max() + 1
-        out = mtz[:-4] + parser.mtz_suffix
-        del(ds['image_id'])
-        ds = ds.set_index(['H', 'K', 'L'])
-        ds.write_mtz(out)
+            batch_end = ds['image_id'].max() + 1
+            out = mtz[:-4] + parser.mtz_suffix
+            del(ds['image_id'])
+            ds = ds.set_index(['H', 'K', 'L'])
+            ds.write_mtz(out)
 
-        image_op_id = op_id[batch_start:batch_end]
-        counts = np.bincount(image_op_id, minlength=len(reindexing_ops))
-        line = f"{i+1},{mtz}," + ','.join(map(str, counts)) + '\n'
+            image_op_id = op_id[batch_start:batch_end]
+            counts = np.bincount(image_op_id, minlength=len(reindexing_ops))
+            line = f"{i+1},{mtz}," + ','.join(map(str, counts)) + '\n'
+            csv = csv + line
+            batch_start = batch_end
+
+        counts = np.bincount(op_id, minlength=len(reindexing_ops))
+        line = f"{i+1},Total," + ','.join(map(str, counts)) + '\n'
         csv = csv + line
-        batch_start = batch_end
 
-    counts = np.bincount(op_id, minlength=len(reindexing_ops))
-    line = f"{i+1},Total," + ','.join(map(str, counts)) + '\n'
-    csv = csv + line
+        print("Reindexing operation counts:")
+        print(csv)
+        out = dirname(parser.mtz[0]) + '/scramble.log'
+        with open(out, 'w') as f:
+            f.write(csv)
 
-    print("Reindexing operation counts:")
-    print(csv)
-    out = dirname(parser.mtz[0]) + '/scramble.log'
-    with open(out, 'w') as f:
-        f.write(csv)
+        counts = np.bincount(op_id)
+        x = np.arange(len(counts))
+        plt.bar(x, counts, color='k')
+        plt.xticks(
+            x,
+            [op.gemmi_op.triplet() for op in reindexing_ops],
+            ha='right', 
+            rotation=45,
+            rotation_mode='anchor',
+        )
+        plt.xlabel('Reindexing Operation')
+        plt.ylabel('Images')
+        plt.title('Reindexing Results')
+        if parser.plot:
+            plt.show()
 
-    counts = np.bincount(op_id)
-    x = np.arange(len(counts))
-    plt.bar(x, counts, color='k')
-    plt.xticks(
-        x,
-        [op.gemmi_op.triplet() for op in reindexing_ops],
-        ha='right', 
-        rotation=45,
-        rotation_mode='anchor',
-    )
-    plt.xlabel('Reindexing Operation')
-    plt.ylabel('Images')
-    plt.title('Reindexing Results')
-    if parser.plot:
-        plt.show()
-
-    out = dirname(parser.mtz[0]) + '/scramble.png'
-    plt.savefig(out)
+        out = dirname(parser.mtz[0]) + '/scramble.png'
+        plt.savefig(out)
 
 
 if __name__=="__main__":
