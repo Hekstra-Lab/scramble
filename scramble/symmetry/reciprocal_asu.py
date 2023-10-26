@@ -52,42 +52,62 @@ class ReciprocalASUCollection(torch.nn.Module):
 class ReciprocalASU(torch.nn.Module):
     @rs.decorators.cellify
     @rs.decorators.spacegroupify
-    def __init__(self, cell, spacegroup, dmin, anomalous=False, dtype=None, device=None):
+    def __init__(self, cell, spacegroup, dmin, anomalous=False, dtype=None):
         super().__init__()
+        hmax = cell.get_hkl_limits(dmin)
+        self.register_buffer(
+            'hmax',
+            torch.tensor(hmax, dtype=torch.int),
+        )
+        self.register_buffer(
+            '_cell',
+            torch.tensor([cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma]),
+        )
+        self.register_buffer(
+            '_spacegroup',
+            torch.tensor(list(map(ord, spacegroup.xhm()))),
+        )
         self.anomalous = anomalous
-        self.Hasu = torch.nn.Parameter(
+        self.register_buffer(
+            'Hasu',
             torch.tensor(
                 rs.utils.generate_reciprocal_asu(cell, spacegroup, dmin, anomalous),
-                device=device,
                 dtype=torch.int,
             ),
-            requires_grad=False,
         )
         self.asu_size = len(self.Hasu)
-        self.hmax = cell.get_hkl_limits(dmin)
-        self.spacegroup = spacegroup
-        self.centric = torch.nn.Parameter(
+        self.register_buffer(
+            'centric',
             torch.tensor(
                 rs.utils.is_centric(self.Hasu, self.spacegroup),
                 dtype=torch.bool,
-                device=device,
             ),
-            requires_grad=False,
         )
-        self.multiplicity = torch.nn.Parameter(
+        self.register_buffer(
+            'multiplicity',
             torch.tensor(
                 rs.utils.compute_structurefactor_multiplicity(self.Hasu, self.spacegroup),
                 dtype=torch.float32,
-                device=device
             ),
-            requires_grad=False,
         )
         self.ops = [Op(op) for op in self.spacegroup.operations()]
-        miller_id = self.to_voxel_grid(torch.arange(len(self.Hasu), device=device, dtype=torch.int))
-        self.miller_id = torch.nn.Parameter(
+        miller_id = self.to_voxel_grid(torch.arange(len(self.Hasu), dtype=torch.int))
+        self.register_buffer(
+            'miller_id',
             miller_id,
-            requires_grad=False,
         )
+        self.register_buffer(
+            'seen',
+            torch.zeros((self.asu_size,), dtype=torch.bool),
+        )
+
+    @property
+    def cell(self):
+        return gemmi.UnitCell(*self._cell)
+
+    @property
+    def spacegroup(self):
+        return gemmi.SpaceGroup(''.join(map(chr, self._spacegroup.detach().cpu().numpy())))
 
     def to_voxel_grid(self, asu_values, hkl_limits=None, fill_value=-1):
         dtype = asu_values.dtype
@@ -112,8 +132,10 @@ class ReciprocalASU(torch.nn.Module):
 
     def forward(self, hkl):
         h,k,l = hkl[...,0],hkl[...,1],hkl[...,2]
-        return self.miller_id[h, k, l]
-
+        out = self.miller_id[h, k, l]
+        assert (out >= 0).all()
+        self.seen[out] = True
+        return out
 
 
 if __name__=="__main__":

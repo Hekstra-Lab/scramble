@@ -3,7 +3,7 @@ import reciprocalspaceship as rs
 import torch
 
 class ExpandHarmonics(torch.nn.Module):
-    def __init__(self, dmin):
+    def __init__(self, dmin, wavelength_min=0., wavelength_max=torch.inf):
         super().__init__()
         self.register_buffer(
             'dmin',
@@ -12,8 +12,41 @@ class ExpandHarmonics(torch.nn.Module):
                 dtype=torch.float32,
             ),
         )
+        self.register_buffer(
+            'wavelength_min',
+            torch.tensor(
+                wavelength_min,
+                dtype=torch.float32,
+            ),
+        )
+        self.register_buffer(
+            'wavelength_max',
+            torch.tensor(
+                wavelength_max,
+                dtype=torch.float32,
+            ),
+        )
 
-    def calculate_harmonic(self, hkl):
+    def convolve_harmonics(self, tensor, harmonic_id, size=None):
+        if size is None:
+            size = harmonic_id.max() + 1
+        d = tensor.shape[-1]
+        dtype = tensor.dtype
+        device = tensor.device
+        result = torch.zeros(
+            (size,d), dtype=dtype, device=device
+        )
+        idx = torch.tile(harmonic_id, (1, d))
+        from IPython import embed
+        embed(colors='linux')
+        result = result.scatter_add(
+            -2, 
+            idx, 
+            tensor
+        )
+        return result
+
+    def calculate_harmonics(self, hkl):
         h,k,l = hkl[...,0],hkl[...,1],hkl[...,2]
         n = torch.gcd(torch.gcd(h, k), l)
         return n[...,None]
@@ -37,24 +70,28 @@ class ExpandHarmonics(torch.nn.Module):
             Optionally specify additional n x d medata vectors which will be
             tiled to match the updated miller indices. 
         """
-        n = self.calculate_harmonic(hkl)
+        n = self.calculate_harmonics(hkl)
         hkl_0 = hkl // n
         wavelength_0 = wavelength * n
         d_0 = dHKL * n
-        n_max = torch.floor_divide(d_0, self.dmin).long().squeeze(-1)
+        n_max = torch.floor_divide(d_0, self.dmin).max()
 
-        n = torch.arange(1, n_max.max() + 2)
-        idx,n_obs = torch.where(n <= n_max[:,None])
+        n = torch.arange(1, n_max + 2)
+        wavelength_all = wavelength_0 / n
+        d_all = d_0 / n
+        idx,n_obs = torch.where(
+            (d_all >= self.dmin) & (wavelength_all >= self.wavelength_min) & (wavelength_all <= self.wavelength_max)
+        )
         n_obs = n_obs + 1
 
         hkl_out = hkl_0[idx] * n_obs[:,None]
         dHKL_out =  d_0[idx] / n_obs[:,None]
         wavelength_out =  wavelength_0[idx] / n_obs[:,None]
-        out = [hkl_out, dHKL_out, wavelength_out] + \
-              [metadatum[idx] for metadatum in metadata]
-        return out
+        metadata_out = [metadatum[idx] for metadatum in metadata]
+        out = [hkl_out, dHKL_out, wavelength_out] + metadata_out
+        return out, idx[:,None]
 
-def calculate_harmonic(H):
+def calculate_harmonics(H):
     n = np.gcd.reduce(H, axis=-1)
     return n
 
@@ -97,7 +134,7 @@ def expand_harmonics(ds, dmin=None,  wavelength_key='Wavelength'):
     Hobs = ds.get_hkls()
 
     #Calculated the harmonic as indexed
-    nobs = calculate_harmonic(Hobs)
+    nobs = calculate_harmonics(Hobs)
 
     #Add primary harmonic miller index, wavelength, and resolution
     # H = H_n / n
@@ -150,9 +187,9 @@ if __name__=="__main__":
 
     ds_with_harmonics = expand_harmonics(ds, dmin)
     eh = ExpandHarmonics(dmin)
-    hkl, dHKL, wavelength, metadata = eh(hkl, dHKL, wavelength, metadata)
+    (hkl, dHKL, wavelength, metadata, eI, eSigI), harmonic_id = eh(hkl, dHKL, wavelength, metadata, I, SigI)
 
-    n_obs = eh.calculate_harmonic(hkl)
+    n_obs = eh.calculate_harmonics(hkl)
 
     assert np.all(ds_with_harmonics.get_hkls() == hkl.numpy())
     assert np.isclose(
@@ -164,6 +201,25 @@ if __name__=="__main__":
         dHKL.numpy().squeeze(),
     ).all()
     assert len(ds) == len(ds_with_harmonics.groupby(['H_0', 'K_0', 'L_0']))
+    from IPython import embed
+    embed(colors='linux')
+
+    metadata = ds[['X', 'Y']].to_numpy()
+    hkl = ds.get_hkls()
+    dHKL = ds.compute_dHKL().dHKL.to_numpy()[:,None]
+    I = ds['I'].to_numpy()[:,None]
+    SigI = ds['I'].to_numpy()[:,None]
+    wavelength = ds['Wavelength'].to_numpy()[:,None]
+
+    hkl = torch.tensor(hkl, dtype=torch.long)
+    metadata = torch.tensor(metadata, dtype=torch.float32)
+    dHKL = torch.tensor(dHKL, dtype=torch.float32)
+    I = torch.tensor(I, dtype=torch.float32)
+    SigI = torch.tensor(SigI, dtype=torch.float32)
+    wavelength = torch.tensor(wavelength, dtype=torch.float32)
+    
+    eh = ExpandHarmonics(dmin, 1., 1.2)
+    (hkl, dHKL, wavelength, metadata, eI, eSigI), harmonic_id = eh(hkl, dHKL, wavelength, metadata, I, SigI)
 
     from IPython import embed
     embed(colors='linux')

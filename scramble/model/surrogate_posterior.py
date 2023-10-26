@@ -43,34 +43,6 @@ class SurrogatePosterior(torch.nn.Module):
     def get_f_sigf(self):
         """
         X ~ Gamma(k, 1 / theta) => sqrt(X) ~ GenGamma(p=2, d=2k, a=sqrt(theta))
-        GenGamma(x|p,d,a) =(1/Z) * x**(d-1) * exp(-(x/a)**p) 
-        """
-        k,b = self.concentration,self.rate
-        theta = torch.reciprocal(b)
-        p = 2
-        d = 2 * k
-        a = torch.sqrt(theta)
-
-        from scipy.stats import gengamma
-        """
-        In scipy, 
-        GenGamma(x|a,c) = (1/Z) * x**(ca-1) * exp(-(x)**c) 
-        we have, 
-         - scale = a
-         - ca = d
-         - c = p
-        therefore,
-         - a = d / c
-        """
-        scale = a
-        c = a
-        a = d / c
-        F = gengamma.mean(a, c, scale=a)
-        SigF = gengamma.std(a, c, scale=a)
-
-    def get_f_sigf(self):
-        """
-        X ~ Gamma(k, 1 / theta) => sqrt(X) ~ GenGamma(p=2, d=2k, a=sqrt(theta))
         GenGamma(x|p,d,s) =(1/Z) * x**(d-1) * exp(-(x/s)**p) 
         """
         k,b = self.concentration,self.rate
@@ -100,3 +72,24 @@ class SurrogatePosterior(torch.nn.Module):
         SigF = gengamma.std(a, c, scale=scale)
 
         return F,SigF
+
+    def to_dataset(self):
+        cell = self.reciprocal_asu.cell
+        spacegroup = self.reciprocal_asu.spacegroup
+        F, SigF = self.get_f_sigf()
+        q = self.distribution()
+        h,k,l = self.reciprocal_asu.Hasu.T
+        out = rs.DataSet({
+            'H' : rs.DataSeries(h, dtype='H'),
+            'K' : rs.DataSeries(k, dtype='H'),
+            'L' : rs.DataSeries(l, dtype='H'),
+            'I' : rs.DataSeries(q.mean.detach().cpu().numpy(), dtype='J'),
+            'SIGI' : rs.DataSeries(q.stddev.detach().cpu().numpy(), dtype='Q'),
+            'F' : rs.DataSeries(F, dtype='F'),
+            'SIGF' : rs.DataSeries(SigF, dtype='Q'),
+        }, merged=True, cell=cell, spacegroup=spacegroup)
+        idx = self.reciprocal_asu.seen.detach().cpu().numpy()
+        out = out[idx]
+        out = out.set_index(["H", "K", "L"])
+        return out
+
