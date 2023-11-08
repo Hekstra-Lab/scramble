@@ -38,3 +38,21 @@ class Op(torch.nn.Module):
         hkl = hkl.type(dtype)
         return hkl
 
+
+
+if __name__=='__main__':
+    cell = gemmi.UnitCell(70., 70., 40., 90., 90., 120.)
+    sg = gemmi.SpaceGroup("P 63")
+    hkl = rs.utils.generate_reciprocal_cell(cell, 2.)
+
+    import gemmi
+    ops = [gemmi.Op("x,y,z")] + \
+        gemmi.find_twin_laws(cell, sg, 1e-3, False)
+
+
+    op = ops[-1]
+    gemmi_hkl = np.array(list(map(op.apply_to_hkl, hkl)))
+
+    test_hkl = Op(op)(torch.tensor(hkl)).detach().cpu().numpy()
+
+    assert (test_hkl == gemmi_hkl).all()

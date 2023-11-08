@@ -3,15 +3,9 @@ import reciprocalspaceship as rs
 import torch
 
 class ExpandHarmonics(torch.nn.Module):
-    def __init__(self, dmin, wavelength_min=0., wavelength_max=torch.inf):
+    def __init__(self, rac, wavelength_min=0., wavelength_max=torch.inf, max_multiplicity=5):
         super().__init__()
-        self.register_buffer(
-            'dmin',
-            torch.tensor(
-                dmin,
-                dtype=torch.float32,
-            ),
-        )
+        self.rac = rac
         self.register_buffer(
             'wavelength_min',
             torch.tensor(
@@ -26,6 +20,7 @@ class ExpandHarmonics(torch.nn.Module):
                 dtype=torch.float32,
             ),
         )
+        self.register_buffer('max_multiplicity', torch.tensor(max_multiplicity))
 
     def convolve_harmonics(self, tensor, harmonic_id, size=None):
         if size is None:
@@ -37,8 +32,6 @@ class ExpandHarmonics(torch.nn.Module):
             (size,d), dtype=dtype, device=device
         )
         idx = torch.tile(harmonic_id, (1, d))
-        from IPython import embed
-        embed(colors='linux')
         result = result.scatter_add(
             -2, 
             idx, 
@@ -51,7 +44,7 @@ class ExpandHarmonics(torch.nn.Module):
         n = torch.gcd(torch.gcd(h, k), l)
         return n[...,None]
 
-    def forward(self, hkl, dHKL, wavelength, *metadata):
+    def forward(self, asu_id, hkl, wavelength):
         """
         Expand the harmonics of hkl updating dHKL and wavelength accordingly. 
         This does not support any leading batch dimensions. 
@@ -71,25 +64,37 @@ class ExpandHarmonics(torch.nn.Module):
             tiled to match the updated miller indices. 
         """
         n = self.calculate_harmonics(hkl)
-        hkl_0 = hkl // n
+        mask = (hkl == 0).all(-1, keepdims=True)
+        dmin = self.rac.dmin[asu_id]
+
+        hkl_0 = hkl // torch.where(mask, 1, n)
         wavelength_0 = wavelength * n
-        d_0 = dHKL * n
-        n_max = torch.floor_divide(d_0, self.dmin).max()
 
-        n = torch.arange(1, n_max + 2)
-        wavelength_all = wavelength_0 / n
-        d_all = d_0 / n
-        idx,n_obs = torch.where(
-            (d_all >= self.dmin) & (wavelength_all >= self.wavelength_min) & (wavelength_all <= self.wavelength_max)
+        d_0 = self.rac.compute_dHKL(asu_id, hkl_0)
+        n_max = torch.minimum(
+            torch.where(mask, 0, d_0 // dmin),
+            torch.where(mask, 0, wavelength_0 // self.wavelength_min)
         )
-        n_obs = n_obs + 1
+        n_min = torch.where(mask, 0, wavelength_0 // self.wavelength_max + 1)
+        multiplicity = n_max - n_min + 1
+        multiplicity = torch.maximum(torch.zeros_like(multiplicity), multiplicity)
+        multiplicity = torch.where(mask, 0, multiplicity)
+        multiplicity = torch.minimum(multiplicity, self.max_multiplicity)
 
-        hkl_out = hkl_0[idx] * n_obs[:,None]
-        dHKL_out =  d_0[idx] / n_obs[:,None]
-        wavelength_out =  wavelength_0[idx] / n_obs[:,None]
-        metadata_out = [metadatum[idx] for metadatum in metadata]
-        out = [hkl_out, dHKL_out, wavelength_out] + metadata_out
-        return out, idx[:,None]
+        n_all = n_min + torch.arange(self.max_multiplicity, device=asu_id.device)
+        n_all = torch.where(n_all <= n_max, n_all, 0)
+
+        hkl_all = hkl_0[...,None,:] * n_all[...,:,None].to(torch.int)
+        refl_id = self.rac(asu_id[...,None], hkl_all)
+        absent = refl_id < 0
+        hkl_all = torch.where(absent[...,None], 0, hkl_all)
+        n_all = torch.where(absent, 0, n_all)
+
+        idx = n_all == 0.
+        d_all = torch.where(idx, 0., d_0) / torch.where(idx, 1., n_all)
+        wavelength_all = torch.where(idx, 0., wavelength_0) / torch.where(idx, 1., n_all)
+
+        return hkl_all, wavelength_all[...,None], d_all[...,None], refl_id[...,None]
 
 def calculate_harmonics(H):
     n = np.gcd.reduce(H, axis=-1)
