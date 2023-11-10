@@ -1,1 +1,1 @@
-from .harmonics import expand_harmonics, ExpandHarmonics
+from .harmonics import ExpandHarmonics

@@ -63,13 +63,17 @@ class MergingModel(torch.nn.Module):
         Ipred = []
 
         for op in self.surrogate_posterior.reindexing_ops:
-            _hkl = op(hkl)
-            _hkl,_wavelength,_dHKL,refl_id = self.expand_harmonics(asu_id, _hkl, wavelength)
-            mask = refl_id >= 0
+            with torch.no_grad():
+                _hkl = op(hkl)
+                _hkl,_wavelength,_dHKL,refl_id = self.expand_harmonics(asu_id, _hkl, wavelength)
+                mask = refl_id >= 0
 
+            d_inv = torch.zeros_like(_dHKL)
+            pos = d_inv > 0.
+            d_inv[pos] = torch.reciprocal(torch.square(_dHKL[pos]))
             _metadata = torch.concat((
                 metadata[...,None,:] * torch.ones_like(_dHKL),
-                torch.reciprocal(torch.square(torch.where(_dHKL > 0., _dHKL, 1.))),
+                d_inv,
                 _wavelength,
             ), axis=-1)
 
@@ -81,15 +85,19 @@ class MergingModel(torch.nn.Module):
                 sample_size=mc_samples
             )
 
-            _Ipred = z.T[refl_id.squeeze(-1)] * scale
-            _Ipred = _Ipred.sum(-2)
+            _Ipred = torch.zeros(
+                scale.shape[:-1] + (mc_samples,),
+                dtype=scale.dtype,
+                device=scale.device,
+            )
+            _Ipred[mask.squeeze(-1)] = z.T[refl_id[mask]] * scale[mask.squeeze(-1)]
+            _Ipred = _Ipred.sum(-2) #This unassuming line is harmonic deconvolution
             mask = mask.any(-2).squeeze(-1)
 
-
-
-            _ll = self.likelihood(_Ipred, I, SigI)
+            _ll = torch.zeros_like(_Ipred)
+            _ll[mask] = self.likelihood(_Ipred[mask], I[mask], SigI[mask])
             _ll = _ll.mean(-1) #Expected log likelihood averages over samples
-            _ll = torch.where(mask, _ll, 0.).sum(-1) / mask.sum(-1) #Average per image
+            _ll =  _ll.sum(-1) / mask.sum(-1) #Average per image
             _Ipred = _Ipred.mean(-1)
 
             ll.append(_ll)
@@ -109,21 +117,19 @@ class MergingModel(torch.nn.Module):
         }
 
         if return_cc:
-            Ipred = torch.dstack(Ipred)
-            batch_idx = torch.arange(I.shape[0], dtype=op_idx.dtype, device=op_idx.device)
-            Ipred = Ipred[batch_idx, :, op_idx]
+            with torch.no_grad():
+                Ipred = torch.dstack(Ipred)
+                batch_idx = torch.arange(I.shape[0], dtype=op_idx.dtype, device=op_idx.device)
+                Ipred = Ipred[batch_idx, :, op_idx]
 
-            w = torch.where(
-                mask,
-                torch.reciprocal(torch.square(SigI.squeeze(-1))),
-                0.
-            )
-            cc = weighted_pearson(
-                I.flatten(),
-                Ipred.flatten(),
-                w.flatten(),
-            )
-            metrics['CCpred'] = float(cc)
+                w = torch.zeros_like(SigI)
+                w[mask] = torch.reciprocal(torch.square(SigI[mask]))
+                cc = weighted_pearson(
+                    I.flatten(),
+                    Ipred.flatten(),
+                    w.flatten(),
+                )
+                metrics['CCpred'] = float(cc)
 
         out = (elbo, metrics)
         if return_op:

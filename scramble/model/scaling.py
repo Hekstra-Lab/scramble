@@ -32,7 +32,7 @@ class ScalingModel(torch.nn.Module):
 
         scale = self.linear_in(metadata)
         scale = scale + image_rep
-        scale = self.mlp(scale)
+        scale[mask.squeeze(-1)] = self.mlp(scale[mask.squeeze(-1)])
         scale = self.linear_out(scale)
 
         scale = torch.where(mask, scale, 0.)
